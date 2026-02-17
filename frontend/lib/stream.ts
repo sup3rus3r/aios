@@ -1,0 +1,244 @@
+import type { Message, ToolCall, ReasoningStep, AgentStep, ToolRound, FileAttachment, WorkflowStepResult } from "@/types/playground"
+
+// Stream directly to the backend, bypassing the Next.js rewrite proxy
+// which buffers the entire SSE response instead of streaming it through.
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000"
+
+export async function streamChat(
+  accessToken: string,
+  sessionId: string,
+  message: string,
+  onContentDelta: (content: string) => void,
+  onToolCall: (toolCall: ToolCall) => void,
+  onReasoning: (reasoning: ReasoningStep) => void,
+  onComplete: (message: Message) => void,
+  onError: (error: string) => void,
+  onAgentStep?: (step: AgentStep) => void,
+  onToolRound?: (round: ToolRound) => void,
+  signal?: AbortSignal,
+  attachments?: FileAttachment[],
+): Promise<void> {
+  const body: Record<string, unknown> = {
+    session_id: sessionId,
+    message,
+    stream: true,
+  }
+  if (attachments && attachments.length > 0) {
+    body.attachments = attachments.map((a) => ({
+      filename: a.filename,
+      media_type: a.media_type,
+      file_type: a.file_type,
+      data: a.data,
+    }))
+  }
+
+  const response = await fetch(`${BACKEND_URL}/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}))
+    onError(errorData.detail || `Request failed with status ${response.status}`)
+    return
+  }
+
+  if (!response.body) {
+    onError("No response body")
+    return
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let currentEventType = ""
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split("\n")
+      buffer = lines.pop() || ""
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+
+        if (trimmed.startsWith("event: ")) {
+          currentEventType = trimmed.slice(7).trim()
+          continue
+        }
+
+        if (trimmed.startsWith("data: ")) {
+          const dataStr = trimmed.slice(6)
+          try {
+            const data = JSON.parse(dataStr)
+
+            switch (currentEventType) {
+              case "content_delta":
+                onContentDelta(data.content || "")
+                break
+              case "tool_call":
+                onToolCall(data)
+                break
+              case "reasoning_delta":
+                onReasoning({
+                  type: "thinking",
+                  content: data.content || "",
+                })
+                break
+              case "agent_step":
+                onAgentStep?.(data)
+                break
+              case "tool_round":
+                onToolRound?.(data)
+                break
+              case "message_complete":
+                onComplete(data)
+                break
+              case "error":
+                onError(data.error || "Unknown error")
+                break
+              case "done":
+                return
+            }
+          } catch {
+            // Skip malformed JSON
+          }
+          currentEventType = ""
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+
+export interface WorkflowStartEvent {
+  run_id: string
+  workflow_name: string
+  total_steps: number
+}
+
+export interface StepStartEvent {
+  step_order: number
+  agent_id: string
+  agent_name: string
+  task: string
+}
+
+export interface StepCompleteEvent {
+  step_order: number
+  agent_name: string
+  output: string
+}
+
+export interface WorkflowCompleteEvent {
+  run_id: string
+  final_output: string
+}
+
+export async function streamWorkflow(
+  accessToken: string,
+  workflowId: string,
+  input: string,
+  onWorkflowStart: (event: WorkflowStartEvent) => void,
+  onStepStart: (event: StepStartEvent) => void,
+  onStepContentDelta: (stepOrder: number, content: string) => void,
+  onStepComplete: (event: StepCompleteEvent) => void,
+  onStepError: (stepOrder: number, error: string) => void,
+  onWorkflowComplete: (event: WorkflowCompleteEvent) => void,
+  onWorkflowError: (runId: string, error: string) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(`${BACKEND_URL}/workflows/${workflowId}/run`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ input }),
+    signal,
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}))
+    onWorkflowError("", errorData.detail || `Request failed with status ${response.status}`)
+    return
+  }
+
+  if (!response.body) {
+    onWorkflowError("", "No response body")
+    return
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let currentEventType = ""
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split("\n")
+      buffer = lines.pop() || ""
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+
+        if (trimmed.startsWith("event: ")) {
+          currentEventType = trimmed.slice(7).trim()
+          continue
+        }
+
+        if (trimmed.startsWith("data: ")) {
+          const dataStr = trimmed.slice(6)
+          try {
+            const data = JSON.parse(dataStr)
+
+            switch (currentEventType) {
+              case "workflow_start":
+                onWorkflowStart(data)
+                break
+              case "step_start":
+                onStepStart(data)
+                break
+              case "step_content_delta":
+                onStepContentDelta(data.step_order, data.content || "")
+                break
+              case "step_complete":
+                onStepComplete(data)
+                break
+              case "step_error":
+                onStepError(data.step_order, data.error || "Unknown error")
+                break
+              case "workflow_complete":
+                onWorkflowComplete(data)
+                break
+              case "workflow_error":
+                onWorkflowError(data.run_id || "", data.error || "Unknown error")
+                break
+              case "done":
+                return
+            }
+          } catch {
+            // Skip malformed JSON
+          }
+          currentEventType = ""
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
